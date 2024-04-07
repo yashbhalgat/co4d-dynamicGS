@@ -59,6 +59,9 @@ class Scene:
         elif os.path.exists(os.path.join(args.source_path, "transforms.json")):
             print("Found calibration_full.json, assuming Dynamic-360 data set!")
             scene_info = sceneLoadTypeCallbacks["dynamic360"](args.source_path)
+        elif os.path.exists(os.path.join(args.source_path, "cam0_timestamps.txt")):
+            print("Found first_frame, assuming CO4D data set!")
+            scene_info = sceneLoadTypeCallbacks["co4d"](args.source_path, args.eval)
         else:
             assert False, "Could not recognize scene type!"
 

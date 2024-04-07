@@ -11,6 +11,7 @@
 
 import os
 import sys
+from copy import deepcopy
 from PIL import Image
 from typing import NamedTuple, Optional
 from scene.colmap_loader import read_extrinsics_text, read_intrinsics_text, qvec2rotmat, \
@@ -169,15 +170,15 @@ def storePly(path, xyz, rgb):
     ply_data.write(path)
 
 
-def readColmapSceneInfo(path, images, eval, llffhold=8):
+def readColmapSceneInfo(path, images, eval, llffhold=8, subdir="sparse/0"):
     try:
-        cameras_extrinsic_file = os.path.join(path, "sparse/0", "images.bin")
-        cameras_intrinsic_file = os.path.join(path, "sparse/0", "cameras.bin")
+        cameras_extrinsic_file = os.path.join(path, subdir, "images.bin")
+        cameras_intrinsic_file = os.path.join(path, subdir, "cameras.bin")
         cam_extrinsics = read_extrinsics_binary(cameras_extrinsic_file)
         cam_intrinsics = read_intrinsics_binary(cameras_intrinsic_file)
     except:
-        cameras_extrinsic_file = os.path.join(path, "sparse/0", "images.txt")
-        cameras_intrinsic_file = os.path.join(path, "sparse/0", "cameras.txt")
+        cameras_extrinsic_file = os.path.join(path, subdir, "images.txt")
+        cameras_intrinsic_file = os.path.join(path, subdir, "cameras.txt")
         cam_extrinsics = read_extrinsics_text(cameras_extrinsic_file)
         cam_intrinsics = read_intrinsics_text(cameras_intrinsic_file)
 
@@ -197,9 +198,9 @@ def readColmapSceneInfo(path, images, eval, llffhold=8):
 
     nerf_normalization = getNerfppNorm(train_cam_infos)
 
-    ply_path = os.path.join(path, "sparse/0/points3D.ply")
-    bin_path = os.path.join(path, "sparse/0/points3D.bin")
-    txt_path = os.path.join(path, "sparse/0/points3D.txt")
+    ply_path = os.path.join(path, subdir, "points3D.ply")
+    bin_path = os.path.join(path, subdir, "points3D.bin")
+    txt_path = os.path.join(path, subdir, "points3D.txt")
     if not os.path.exists(ply_path):
         print("Converting point3d.bin to .ply, will happen only the first time you open the scene.")
         try:
@@ -597,10 +598,152 @@ def readPlenopticVideoDataset(path, eval, num_images, hold_id=[0]):
     return scene_info
 
 
+def load_dustr_poses(meta, assume_colmap=False):
+    # NOTE: assuming the camera poses are in Blender convention
+    cam_dict = {}
+    for cam in meta["cameras"]:
+        extrinsics_blender = np.array(cam["transform_matrix"])
+        if assume_colmap:
+            extrinsics_blender = extrinsics_blender @ np.array(
+                [[1, 0, 0, 0], [0, -1, 0, 0], [0, 0, -1, 0], [0, 0, 0, 1]])
+        matrix = np.linalg.inv(extrinsics_blender)
+        R = -np.transpose(matrix[:3, :3])
+        R[:, 0] = -R[:, 0]
+        T = -matrix[:3, 3]
+        intrinsics = np.array(cam["intrinsics"])
+        cam_dict[os.path.basename(cam["file_path"]).split(".")[0]] = {
+            "R": R,
+            "T": T,
+            "intrinsics": intrinsics
+        }
+    return cam_dict
+
+
+def load_vggsfm_poses(cameras_extrinsic_file, cameras_intrinsic_file, points_txt):
+    cam_extrinsics = read_extrinsics_text(cameras_extrinsic_file)
+    cam_intrinsics = read_intrinsics_text(cameras_intrinsic_file)
+    cam_dict = {}
+    for idx, key in enumerate(cam_extrinsics):
+        extr = cam_extrinsics[key]
+        intr = cam_intrinsics[extr.camera_id]
+        height = intr.height
+        width = intr.width
+
+        R = np.transpose(qvec2rotmat(extr.qvec))
+        T = np.array(extr.tvec)
+
+        if intr.model == "SIMPLE_PINHOLE":
+            focal_length_x = intr.params[0]
+            FovY = focal2fov(focal_length_x, height)
+            FovX = focal2fov(focal_length_x, width)
+        else:
+            focal_length_x = intr.params[0]
+            focal_length_y = intr.params[1]
+            FovY = focal2fov(focal_length_y, height)
+            FovX = focal2fov(focal_length_x, width)
+
+        cam_dict[os.path.basename(extr.name).split(".")[0]] = {"R": R, "T": T, "FovY": FovY, "FovX": FovX}
+
+    xyz, rgb, _ = read_points3D_text(points_txt)
+    storePly(points_txt.replace(".txt", ".ply"), xyz, rgb)
+    pcd = fetchPly(points_txt.replace(".txt", ".ply"))
+
+    return cam_dict, pcd    
+
+
+def readCO4DDataset(path, eval):
+    # path is something like "/work/yashsb/datasets/co4d/setup_03/dev0/s2"
+    root_path = os.path.dirname(os.path.dirname(path)) # "/work/yashsb/datasets/co4d/setup_03"
+    
+    ####### USING COLMAP POSES (from vggsfm) #######
+    cam_poses, _ = load_vggsfm_poses(
+        cameras_extrinsic_file=os.path.join(root_path, "poses/s2_t2/images.txt"),
+        cameras_intrinsic_file=os.path.join(root_path, "poses/s2_t2/cameras.txt"),
+        points_txt=os.path.join(root_path, "poses/s2_t2/points3D.txt"))
+    
+    # ####### Using DUSTR Poses #######
+    # cam_poses = load_dustr_poses(
+    #     meta=json.load(open(os.path.join(root_path, "poses/metadata.json"), "r")))
+
+    train_cam_infos, test_cam_infos = [], []
+    for cam in cam_poses:
+        cam_dir = os.path.join(path, cam)
+        image_paths = sorted(glob(os.path.join(cam_dir, "*.png")))
+        for idx, image_path in enumerate(image_paths):
+            image = Image.open(image_path)
+            cam_info = CameraInfo(uid=idx, R=cam_poses[cam]["R"], T=cam_poses[cam]["T"], 
+                                  FovY=cam_poses[cam]["FovY"], FovX=cam_poses[cam]["FovX"], image=image.copy(),
+                                  image_path=image_path, image_name=os.path.basename(image_path).split(".")[0], 
+                                  width=image.size[0], height=image.size[1],
+                                  fid=idx/(len(image_paths)-1))
+            image.close()
+            if eval:
+                if cam == "camera_5": # hold out last camera for testing
+                    test_cam_infos.append(cam_info)
+                else:
+                    train_cam_infos.append(cam_info)
+            else:
+                train_cam_infos.append(cam_info)
+    
+    nerf_normalization = getNerfppNorm(train_cam_infos)
+    ply_path = os.path.join(path, 'points3D.ply')
+    # ply_path = os.path.join(root_path, "poses/s2_t1/points3D.ply")
+    if not os.path.exists(ply_path):
+        num_pts = 100_000
+        print(f"Generating random point cloud ({num_pts})...")
+        # We create random points inside the bounds
+        center = -nerf_normalization["translate"]
+        radius = nerf_normalization["radius"]
+        xyz = np.random.random((num_pts, 3)) * 2.0 * radius - radius + center
+        shs = np.random.random((num_pts, 3)) / 255.0
+        pcd = BasicPointCloud(points=xyz, colors=SH2RGB(shs), normals=np.zeros((num_pts, 3)))
+        storePly(ply_path, xyz, SH2RGB(shs) * 255)
+
+    try:
+        pcd = fetchPly(ply_path)
+    except:
+        pcd = None
+    
+    scene_info = SceneInfo(point_cloud=pcd,
+                           train_cameras=train_cam_infos,
+                           test_cameras=test_cam_infos,
+                           nerf_normalization=nerf_normalization,
+                           ply_path=ply_path)
+    return scene_info
+
+
 sceneLoadTypeCallbacks = {
     "Colmap": readColmapSceneInfo,  # colmap dataset reader from official 3D Gaussian [https://repo-sam.inria.fr/fungraph/3d-gaussian-splatting/]
     "Blender": readNerfSyntheticInfo,  # D-NeRF dataset [https://drive.google.com/file/d/1uHVyApwqugXTFuIRRlE4abTW8_rrVeIK/view?usp=sharing]
     "DTU": readNeuSDTUInfo,  # DTU dataset used in Tensor4D [https://github.com/DSaurus/Tensor4D]
     "nerfies": readNerfiesInfo,  # NeRFies & HyperNeRF dataset proposed by [https://github.com/google/hypernerf/releases/tag/v0.1]
     "plenopticVideo": readPlenopticVideoDataset,  # Neural 3D dataset in [https://github.com/facebookresearch/Neural_3D_Video]
+    "co4d": readCO4DDataset,  # our CO4D dataset
 }
+
+
+################################################
+##### EXTRA UN-USED FUNCTIONS #####
+# ##############################################
+# def P2B(R:np.ndarray, T:np.ndarray)->np.ndarray:
+#     P2B_R1 = np.array([[1,0,0],[0,0,-1],[0,1,0]], dtype=np.float64)
+#     P2B_R2 = np.array([[-1,0,0],[0,1,0],[0,0,-1]], dtype=np.float64)
+#     P2B_T  = np.array([[-1,0,0],[0,0,1],[0,-1,0]], dtype=np.float64)
+#     vec4w  = np.array([[0,0,0,1]], dtype=np.float64)
+#     Bcol3 = P2B_T @ R @ T
+#     B3x3  = P2B_R1 @ R @ P2B_R2
+#     B3x4 = np.concatenate([B3x3, Bcol3[:,None]], axis=1)
+#     B = np.concatenate([B3x4,vec4w], axis=0)
+#     return B
+
+# def co4d_to_blender(extrinsics):
+#     R = deepcopy(extrinsics[:3, :3])
+#     T = deepcopy(extrinsics[:3, 3])
+#     # T[:2] *= -1
+#     # R[:, :2] *= -1
+#     # R = R.transpose()
+#     # extrinsics_opencv = np.concatenate([np.concatenate([R, T.reshape(-1, 1)], axis=1), [[0, 0, 0, 1]]], axis=0)
+#     # extrinsics_blender = extrinsics_opencv @ np.array([[1, 0, 0, 0], [0, -1, 0, 0], [0, 0, -1, 0], [0, 0, 0, 1]])
+#     extrinsics_blender = P2B(R, T)
+#     return extrinsics_blender
+#
